@@ -12,7 +12,7 @@ from UNet import UNet
 from CNNMoE import CNNMoE
 
 # Config - Single model training
-model_class = UNet  # Change this to TransUNet or CNNMoE as needed
+model = UNet() 
 model_name = "UNet"  # For saving files
 num_epochs = 40
 num_obs = 1000  # Fixed number of observations
@@ -29,7 +29,7 @@ if __name__ == "__main__":
     buildings_filepath = "../../lab1/RadioMapSeer/png/buildings_complete"
 
     # Create model
-    model = model_class().to(device)
+    model = model.to(device)
     print(f"Training {model_name} with {num_obs} observations for {num_epochs} epochs\n")
 
     # Create dataset
@@ -102,9 +102,30 @@ if __name__ == "__main__":
     plot_loss_over_epochs(train_losses, val_losses, filepath)
     print(f"Loss over epochs plot saved to {filepath}\n")
 
-    print("Evaluating Model\n")
+    print("Evaluating Model (sampling only)\n")
+    # Use a smaller subset for evaluation
+    small_eval_loader = DataLoader(dataset, batch_size=16, shuffle=False, num_workers=4, pin_memory=True)
     filepath = f"images/{model_name}_sample_predictions_{num_epochs}_epochs_{num_obs}_observations.png"
-    evaluate_model(model, eval_loader, device, filepath)
+    evaluate_model(model, small_eval_loader, device, filepath)
     print(f"Predictions saved to {filepath}\n")
 
-    print(f"Training completed! Final train MSE: {train_losses[-1]:.6f}, Final val MSE: {val_losses[-1]:.6f}") 
+    print("Skipping full evaluation to avoid memory issues")
+    print("Training completed successfully!") 
+
+    # 500 1000 1500 2000 5000
+    # 
+
+
+    # 256 x 256 x 3 
+
+    # --- > 16 x 16 x 3
+
+    # gate (vector)
+
+    # CNN Expert 1 x 1 x channel
+
+    # Attention Layer
+    # 768
+    # Results with obs = [5, 25, 100, 250, 1000, 2500, 10000]
+    #[0.0006425116299525349, 0.0008907116661924396, 0.0007259226216470953, 0.0006376319066584827, 0.00037294928135267973, 0.0003068667825319062, 0.0002632871113533882]
+    #[0.0006645574604264711, 0.0008313714056780639, 0.0005999746389146336, 0.0005206517521796825, 0.00034185701824416447, 0.00024641768635847155, 0.00023710251061415856]
