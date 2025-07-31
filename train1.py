@@ -12,23 +12,45 @@ from UNet import UNet
 from CNNMoE import CNNMoE
 
 # Config - Single model training
-model = UNet() 
-model_name = "UNet"  # For saving files
-num_epochs = 40
+model = CNNMoE() 
+model_name = "CNNMoE"  # For saving files
+num_epochs = 15
 num_obs = 1000  # Fixed number of observations
 
 if __name__ == "__main__":
-    # Check CUDA
+    # Check CUDA and fix device leakage
     device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
     print("Using device:", device, "\n")
-    torch.backends.cudnn.benchmark = True
+    
+    # Force CUDA to use the correct device and optimize
+    if torch.cuda.is_available():
+        torch.cuda.set_device(device)  # Fix GPU 0 leakage
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False  # Speed optimization
+        
+        # ENABLE TENSOR CORES FOR SPEED (1.3x speedup)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Clear any existing tensors on wrong device
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+        
+        # Optional: detect reference cycles causing GPU memory leaks
+        try:
+            from torch.utils.viz._cycles import warn_tensor_cycles
+            warn_tensor_cycles()
+            print("✅ Reference cycle detection enabled")
+        except:
+            pass  # Not available in all PyTorch versions
 
     # Dataset filepaths
     gain_filepath = "../../lab1/RadioMapSeer/gain/DPM"
     transmitter_filepath = "../../lab1/RadioMapSeer/png/antennas"
     buildings_filepath = "../../lab1/RadioMapSeer/png/buildings_complete"
 
-    # Create model
+    # Create model 
     model = model.to(device)
     print(f"Training {model_name} with {num_obs} observations for {num_epochs} epochs\n")
 
@@ -43,19 +65,20 @@ if __name__ == "__main__":
 
     train_set, val_set = random_split(dataset, [num_train, num_val])
 
-    # DataLoader
-    train_loader = DataLoader(train_set, batch_size=64, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True)
-    val_loader = DataLoader(val_set, batch_size=64, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True)
-    eval_loader = DataLoader(dataset, batch_size=32, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True)
+    # DataLoader - ALIGNED WITH train.py
+    train_loader = DataLoader(train_set, batch_size=64, shuffle=True, num_workers=8, pin_memory=True)
+    val_loader = DataLoader(val_set, batch_size=64, shuffle=False, num_workers=8, pin_memory=True)
+    eval_loader = DataLoader(dataset, batch_size=32, shuffle=False, num_workers=8, pin_memory=True)
     print("Data Successfully Loaded\n")
 
     # Sanity Check: Dataset
     plot_samples_sanity_test(dataset)
     print("Dataset sanity check plot saved to images/random_sample_sanity_test.png\n")
 
-    # Training Setup
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, eps=1e-8)
+    # Training Setup - ALIGNED WITH train.py
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, eps=1e-8)  # Same as train.py
     scaler = GradScaler("cuda")
+    aux_loss_weight = 0.001 
     train_losses, val_losses = [], []
 
     # Training Loop
@@ -70,8 +93,9 @@ if __name__ == "__main__":
             optimizer.zero_grad(set_to_none=True)
 
             with autocast("cuda"):
-                preds = model(x)
-                loss = masked_mse_loss(preds, y, bld_mask)
+                preds, aux_loss = model(x)
+                main_loss = masked_mse_loss(preds, y, bld_mask)
+                loss = main_loss + aux_loss_weight * aux_loss
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -90,8 +114,9 @@ if __name__ == "__main__":
         with torch.no_grad(), autocast("cuda"):
             for batch in tqdm(val_loader, desc=f"[Epoch {epoch}] Validation", leave=False):
                 x, y, bld_mask = prepare_batch(batch, device)
-                preds = model(x)
-                val_loss += masked_mse_loss(preds, y, bld_mask).item() * x.size(0)
+                preds, aux_loss = model(x)
+                main_loss = masked_mse_loss(preds, y, bld_mask)
+                val_loss += main_loss.item() * x.size(0)
 
         val_mse = val_loss / len(val_loader.dataset)
         val_losses.append(val_mse)
@@ -108,24 +133,4 @@ if __name__ == "__main__":
     filepath = f"images/{model_name}_sample_predictions_{num_epochs}_epochs_{num_obs}_observations.png"
     evaluate_model(model, small_eval_loader, device, filepath)
     print(f"Predictions saved to {filepath}\n")
-
-    print("Skipping full evaluation to avoid memory issues")
     print("Training completed successfully!") 
-
-    # 500 1000 1500 2000 5000
-    # 
-
-
-    # 256 x 256 x 3 
-
-    # --- > 16 x 16 x 3
-
-    # gate (vector)
-
-    # CNN Expert 1 x 1 x channel
-
-    # Attention Layer
-    # 768
-    # Results with obs = [5, 25, 100, 250, 1000, 2500, 10000]
-    #[0.0006425116299525349, 0.0008907116661924396, 0.0007259226216470953, 0.0006376319066584827, 0.00037294928135267973, 0.0003068667825319062, 0.0002632871113533882]
-    #[0.0006645574604264711, 0.0008313714056780639, 0.0005999746389146336, 0.0005206517521796825, 0.00034185701824416447, 0.00024641768635847155, 0.00023710251061415856]

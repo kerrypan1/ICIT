@@ -5,6 +5,7 @@ from tqdm import tqdm
 from torch.amp import autocast, GradScaler
 import pandas as pd
 import time
+import torch.multiprocessing as mp
 
 from HelperFunctions import plot_samples_sanity_test, plot_loss_over_epochs, evaluate_model, prepare_batch
 from Loss import masked_mse_loss
@@ -16,17 +17,54 @@ from UNet import UNet
 from CNNMoE import CNNMoE
 
 # Config
-model_classes = [TransUNet]
-model_names = ["TransUNet"]  # For saving files
+model_classes = [CNNMoE]
+model_names = ["CNNMoE"]  # For saving files
 num_epochs = 40
-num_obser = [2000, 5000]
+num_obser = [500, 1000, 1500, 2000, 5000]
 
 
 if __name__ == "__main__":
-    # Check CUDA
+    # CRITICAL: Set multiprocessing start method to prevent CUDA fork issues
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass  # Already set
+    
+    # Check CUDA and apply optimizations
     device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
     print("Using device:", device, "\n")
-    torch.backends.cudnn.benchmark = True
+    
+    # GPU optimizations and PREVENT GPU 0 LEAKAGE
+    if torch.cuda.is_available():
+        # CRITICAL: Set device BEFORE any GPU operations to prevent GPU 0 leakage
+        torch.cuda.set_device(1)  # Use integer device ID, not torch.device object
+        
+        # Only clear OUR target GPU (don't interfere with other users)
+        with torch.cuda.device(1):
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
+        # Force all operations to use the correct device
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False  # Faster non-deterministic algorithms
+        
+        # ENABLE TENSOR CORES FOR SPEED (1.3x speedup)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Final cleanup on correct device
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        print("✅ GPU optimizations enabled:")
+        print("  - Device set to CUDA:1 with spawn multiprocessing")
+        print("  - TF32 Tensor Cores (1.3x speedup)")
+        print("  - Non-deterministic algorithms (faster)")
+        print("  - GPU 1 cache cleared (respects other users on GPU 0)")
+        print("  - Multiprocessing start method: spawn (prevents CUDA fork issues)")
+    else:
+        torch.backends.cudnn.benchmark = True
     
     # Print initial GPU memory status
     if torch.cuda.is_available():
@@ -54,7 +92,9 @@ if __name__ == "__main__":
                 print(f"{'='*60}")
                 
                 try:
-                    model = model_class().to(device)
+                    # CRITICAL: Create model AFTER device is properly set to prevent GPU 0 leakage
+                    with torch.cuda.device(1):  # Ensure model creation on correct GPU
+                        model = model_class().to(device)
                     dataset = RadioMapSeerDataset(gain_filepath, transmitter_filepath, buildings_filepath, obs=num_obs)
 
                     # Train/Test Split
@@ -65,10 +105,10 @@ if __name__ == "__main__":
 
                     train_set, val_set = random_split(dataset, [num_train, num_val])
 
-                    # DataLoader
-                    train_loader = DataLoader(train_set, batch_size=64, shuffle=True, num_workers=8, pin_memory=True)
-                    val_loader = DataLoader(val_set, batch_size=64, shuffle=False, num_workers=8, pin_memory=True)
-                    eval_loader = DataLoader(dataset, batch_size=32, shuffle=False, num_workers=8, pin_memory=True)
+                    # DataLoader with spawn multiprocessing (prevents CUDA fork issues)
+                    train_loader = DataLoader(train_set, batch_size=64, shuffle=True, num_workers=6, pin_memory=True)
+                    val_loader = DataLoader(val_set, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
+                    eval_loader = DataLoader(dataset, batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
                     print("Data Successfully Loaded\n")
 
                     # Sanity Check: Dataset
@@ -81,6 +121,7 @@ if __name__ == "__main__":
                     # Training Setup
                     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, eps=1e-8)
                     scaler = GradScaler("cuda")
+                    aux_loss_weight = 0.001  # Reduced weight for auxiliary loss (matches train1.py)
                     train_losses, val_losses = [], []
 
                     # Training Loop
@@ -95,8 +136,9 @@ if __name__ == "__main__":
                             optimizer.zero_grad(set_to_none=True)
 
                             with autocast("cuda"):
-                                preds = model(x)
-                                loss = masked_mse_loss(preds, y, bld_mask)
+                                preds, aux_loss = model(x)
+                                main_loss = masked_mse_loss(preds, y, bld_mask)
+                                loss = main_loss + aux_loss_weight * aux_loss
 
                             scaler.scale(loss).backward()
                             scaler.step(optimizer)
@@ -115,8 +157,9 @@ if __name__ == "__main__":
                         with torch.no_grad(), autocast("cuda"):
                             for batch in tqdm(val_loader, desc=f"[Epoch {epoch}] Validation", leave=False):
                                 x, y, bld_mask = prepare_batch(batch, device)
-                                preds = model(x)
-                                val_loss += masked_mse_loss(preds, y, bld_mask).item() * x.size(0)
+                                preds, aux_loss = model(x)
+                                main_loss = masked_mse_loss(preds, y, bld_mask)
+                                val_loss += main_loss.item() * x.size(0)
 
                         val_mse = val_loss / len(val_loader.dataset)
                         val_losses.append(val_mse)
@@ -128,7 +171,7 @@ if __name__ == "__main__":
                     print(f"Loss over epochs plot saved to {filepath}\n")
 
                     print("Evaluating Model (sampling only)\n")
-                    # Use a smaller subset for evaluation
+                    # Use a smaller subset for evaluation with spawn multiprocessing
                     small_eval_loader = DataLoader(dataset, batch_size=16, shuffle=False, num_workers=4, pin_memory=True)
                     filepath = f"images/{model_name}_sample_predictions_{num_epochs}_epochs_{num_obs}_observations.png"
                     evaluate_model(model, small_eval_loader, device, filepath)
@@ -151,37 +194,34 @@ if __name__ == "__main__":
                     df.to_csv(f"{model_name}_{num_epochs}_epochs_results.csv", index=False)
                     print(f"Results saved to {model_name}_{num_epochs}_epochs_results.csv (time elapsed: {time_elapsed:.2f}s)")
 
-                    # Comprehensive memory cleanup
-
+                    # Streamlined but thorough memory cleanup between observation counts
+                    
+                    # Delete all model-related objects
                     del model, optimizer, scaler
-                    del train_loader, val_loader, eval_loader, small_eval_loader  # Add small_eval_loader
+                    del train_loader, val_loader, eval_loader, small_eval_loader
                     del dataset, train_set, val_set
                     del train_losses, val_losses
                     
-                    # Clear matplotlib cache
+                    # Clear matplotlib figures
                     import matplotlib.pyplot as plt
                     plt.close('all')
                     
-                    # Force garbage collection multiple times
+                    # Ensure tqdm cleanup for clean terminal output
+                    try:
+                        from tqdm import tqdm
+                        tqdm._instances.clear()
+                    except:
+                        pass
+                    
+                    # Single comprehensive cleanup on correct device
                     import gc
                     gc.collect()
-                    gc.collect()  # Second pass
                     
-                    # Clear CUDA cache thoroughly
-                    torch.cuda.empty_cache()
-                    torch.cuda.ipc_collect()
-                    
-                    # Additional CUDA memory management
                     if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                        # Force CUDA to release reserved memory
-                        torch.cuda.empty_cache()
-                        torch.cuda.ipc_collect()
-                        # Reset memory stats to clear fragmentation
-                        torch.cuda.reset_peak_memory_stats()
-                        torch.cuda.reset_accumulated_memory_stats()
-                        # Force memory pool cleanup
-                        torch.cuda.empty_cache()
+                        with torch.cuda.device(1):  # Ensure cleanup on correct GPU
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
+                            torch.cuda.ipc_collect()
                     
                     print(f"Memory after cleanup: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB allocated, {torch.cuda.memory_reserved(device) / 1024**3:.2f} GB reserved")
                 
@@ -191,10 +231,12 @@ if __name__ == "__main__":
                         print(f"Error: {e}")
                         print(f"Memory at failure: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
                         
-                        # Emergency cleanup
+                        # Emergency cleanup on correct device
                         import gc
                         gc.collect()
-                        torch.cuda.empty_cache()
+                        if torch.cuda.is_available():
+                            with torch.cuda.device(1):
+                                torch.cuda.empty_cache()
                         
                         # Skip this configuration and continue
                         train_cumul.append(float('nan'))
@@ -210,13 +252,12 @@ if __name__ == "__main__":
         print(f"ERROR: Training failed with exception: {e}")
         print(f"{'='*60}")
         
-        # Emergency memory cleanup
+        # Emergency memory cleanup on correct device
         import gc
         gc.collect()
-        torch.cuda.empty_cache()
-        
-        # Print current memory status
         if torch.cuda.is_available():
+            with torch.cuda.device(1):
+                torch.cuda.empty_cache()
             print(f"Memory at error: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB allocated")
             print(f"Memory reserved: {torch.cuda.memory_reserved(device) / 1024**3:.2f} GB reserved")
         

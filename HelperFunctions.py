@@ -59,23 +59,32 @@ def evaluate_model(model, eval_loader, device, filepath, num_to_show=3):
     all_preds, all_y, all_b = [], [], []
 
     with torch.no_grad():
-        for batch in tqdm(eval_loader, desc="Full Eval", leave=False):
-            transmitters = batch["transmitters"].to(device)
-            gain_sparse  = batch["gain_sparse"].to(device)
-            bld_mask     = batch["buildings"].to(device)
-            gain_full    = batch["gain_full"].to(device)
+        for batch in tqdm(eval_loader, desc="Evaluating", leave=False):
+            transmitters = batch["transmitters"].to(device, non_blocking=True)
+            gain_sparse  = batch["gain_sparse"].to(device, non_blocking=True)
+            bld_mask     = batch["buildings"].to(device, non_blocking=True)
+            gain_full    = batch["gain_full"].to(device, non_blocking=True)
 
             inp = torch.cat([transmitters, gain_sparse, bld_mask], dim=1)
-            pb = model(inp)
+            model_output = model(inp)
+            
+            # Handle both old and new model output formats
+            if isinstance(model_output, tuple):
+                pb, _ = model_output  # Unpack (predictions, aux_loss)
+            else:
+                pb = model_output  # Old format
 
             if pb.shape[-2:] != gain_full.shape[-2:]:
                 pb = F.interpolate(pb, size=gain_full.shape[-2:], mode='bilinear', align_corners=False)
 
             pb = pb * (bld_mask < 0.5).float()
 
-            all_preds.append(pb.cpu())
-            all_y.append(gain_full.cpu())
-            all_b.append(bld_mask.cpu())
+            all_preds.append(pb.detach().cpu())
+            all_y.append(gain_full.detach().cpu())
+            all_b.append(bld_mask.detach().cpu())
+            
+            # Clear GPU tensors
+            del transmitters, gain_sparse, bld_mask, gain_full, inp, pb
 
     preds = torch.cat(all_preds, dim=0)
     y_all = torch.cat(all_y,    dim=0)

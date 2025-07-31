@@ -31,7 +31,7 @@ class RadioMapSeerDataset(Dataset):
         N = H * W
 
         gen = torch.Generator().manual_seed(idx)
-        weights = torch.ones(N, device=gain.device)
+        weights = torch.ones(N)  # Keep on CPU for multinomial sampling
         sel = torch.multinomial(weights, self.obs, replacement=False, generator=gen)
 
         gain_flat   = gain.view(-1)
